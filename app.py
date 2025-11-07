@@ -10,31 +10,15 @@ import fitz  # PyMuPDF
 
 
 # ===============================
-# Utils
+# Utilitários
 # ===============================
 def no_accents_upper(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
     return s.upper()
 
 
-def words_from_pdf(file_bytes: bytes) -> List[List[Tuple[float, float, float, float, str]]]:
-    """
-    Retorna lista por página. Cada item é (x0, y0, x1, y1, texto).
-    """
-    pages = []
-    with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-        for page in doc:
-            ws = page.get_text("words")  # (x0, y0, x1, y1, "text", block, line, word_no)
-            ws = [(w[0], w[1], w[2], w[3], w[4]) for w in ws]
-            ws.sort(key=lambda t: (round(t[1], 1), t[0]))
-            pages.append(ws)
-    return pages
-
-
 def group_lines(words: List[Tuple[float, float, float, float, str]], tol_y: float = 2.0):
-    """
-    Agrupa palavras por linha (y). Retorna lista de linhas; cada linha é lista de palavras ordenadas por x.
-    """
+    """Agrupa palavras por linha (y)."""
     linhas = []
     cur_y = None
     cur = []
@@ -54,9 +38,6 @@ def group_lines(words: List[Tuple[float, float, float, float, str]], tol_y: floa
     return linhas
 
 
-# ===============================
-# Detecção de cabeçalho e colunas
-# ===============================
 END_MARKERS = [
     "DADOS ADICIONAIS",
     "INFORMACOES COMPLEMENTARES",
@@ -69,13 +50,11 @@ END_MARKERS = [
 
 def find_header_positions(lines: List[List[Tuple[float, float, float, float, str]]]) -> Optional[Dict[str, float]]:
     """
-    Tenta localizar, numa única linha, os títulos das colunas e retorna o x inicial de cada uma.
-    Retorna também a y (linha do cabeçalho) via "__y__".
-    Colunas alvo: COD | DESCRICAO | NCM/SH | CFOP | UN | QTD | V_UNITARIO | V_TOTAL
+    Localiza o cabeçalho da tabela e retorna o x de cada coluna + y do header em "__y__".
+    Alvo: COD | DESCRICAO | NCM/SH | CFOP | UN | QTD | V_UNITARIO | V_TOTAL
     """
     for ln in lines:
         tokens = [no_accents_upper(w[4]) for w in ln]
-        # Exigimos NCM/SH e CFOP na mesma linha (padrão de DANFE)
         if not any("NCM/SH" in t for t in tokens):
             continue
         if "CFOP" not in tokens:
@@ -111,34 +90,30 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
             if t == "QTD":
                 col_x["QTD"] = x0
 
-            # V. UNITÁRIO / V. TOTAL (pode vir como "V." + "UNITÁRIO"/"TOTAL" ou "VALOR UNITÁRIO"/"VALOR TOTAL")
+            # V. UNITÁRIO / V. TOTAL
             if t in {"V.", "V"} and i + 1 < len(ln):
-                next_t = no_accents_upper(ln[i + 1][4])
-                if next_t.startswith("UNIT"):
+                nxt = no_accents_upper(ln[i + 1][4])
+                if nxt.startswith("UNIT"):
                     col_x["V_UNITARIO"] = x0
-                if next_t.startswith("TOTAL"):
+                if nxt.startswith("TOTAL"):
                     col_x["V_TOTAL"] = x0
             if t == "VALOR" and i + 1 < len(ln):
-                next_t = no_accents_upper(ln[i + 1][4])
-                if next_t.startswith("UNIT"):
+                nxt = no_accents_upper(ln[i + 1][4])
+                if nxt.startswith("UNIT"):
                     col_x["V_UNITARIO"] = x0
-                if next_t.startswith("TOTAL"):
+                if nxt.startswith("TOTAL"):
                     col_x["V_TOTAL"] = x0
 
-        needed = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"}
         have = set(col_x.keys())
-        # Considera header válido se achou pelo menos 6 das 8
-        if len(needed.intersection(have)) >= 6:
+        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}
+        if len(have.intersection(need)) >= 6:
             col_x["__y__"] = ln[0][1]
             return col_x
-
     return None
 
 
 def build_column_edges(col_x: Dict[str, float], page_width: float) -> List[Tuple[str, float, float]]:
-    """
-    Com os x dos títulos, gera intervalos [x_ini, x_fim) para cada coluna.
-    """
+    """Gera intervalos [x_ini, x_fim) para cada coluna encontrado no header."""
     keys = [k for k in ["COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"] if k in col_x]
     keys.sort(key=lambda k: col_x[k])
     xs = [col_x[k] for k in keys]
@@ -150,13 +125,21 @@ def build_column_edges(col_x: Dict[str, float], page_width: float) -> List[Tuple
     return edges
 
 
-# ===============================
-# Extração de linhas da tabela
-# ===============================
+def _append_text(base: str, extra: str) -> str:
+    """Une texto cuidando de hifenização e espaços."""
+    base = base.rstrip()
+    extra = extra.lstrip()
+    if base.endswith("-"):
+        return base[:-1] + extra
+    if base:
+        return base + " " + extra
+    return extra
+
+
 def extract_table_page(page, unite_wrapped_description: bool = True) -> List[Dict[str, str]]:
     """
-    Extrai as linhas de uma página, respeitando o cabeçalho encontrado.
-    Retorna lista de dicts (linha crua, sem normalização).
+    Mapeia palavras -> colunas via cabeçalho desta página.
+    Retorna 'linhas cruas' (ainda não consolidadas por item).
     """
     words = page.get_text("words")
     words = [(w[0], w[1], w[2], w[3], w[4]) for w in words]
@@ -174,18 +157,18 @@ def extract_table_page(page, unite_wrapped_description: bool = True) -> List[Dic
     page_width = page.rect.width
     col_edges = build_column_edges(col_x, page_width)
 
-    rows = []
+    raw_rows = []
     past_header = False
     for ln in lines:
         y = ln[0][1]
-        row_text_all = " ".join(no_accents_upper(w[4]) for w in ln)
+        row_text_all_upper = " ".join(no_accents_upper(w[4]) for w in ln)
 
         if not past_header:
             if y <= header_y + 0.5:
                 continue
             past_header = True
 
-        if any(m in row_text_all for m in END_MARKERS):
+        if any(m in row_text_all_upper for m in END_MARKERS):
             break
 
         row = {k: "" for k in ["COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"]}
@@ -194,247 +177,223 @@ def extract_table_page(page, unite_wrapped_description: bool = True) -> List[Dic
             placed = False
             for (k, left, right) in col_edges:
                 if left <= xc < right:
-                    row[k] = (row.get(k, "") + " " + t).strip()
+                    row[k] = _append_text(row.get(k, ""), t)
                     placed = True
                     break
             if not placed:
-                row["DESCRICAO"] = (row.get("DESCRICAO", "") + " " + t).strip()
+                row["DESCRICAO"] = _append_text(row.get("DESCRICAO", ""), t)
 
-        rows.append(row)
+        raw_rows.append(row)
 
-    if unite_wrapped_description and rows:
-        merged = []
-        for r in rows:
-            is_continuation = (
-                r["COD"].strip() == "" and
-                r["NCM/SH"].strip() == "" and
-                r["CFOP"].strip() == "" and
-                r["UN"].strip() == "" and
-                r["QTD"].strip() == "" and
-                r["V_UNITARIO"].strip() == "" and
-                r["V_TOTAL"].strip() == "" and
-                r["DESCRICAO"].strip() != ""
-            )
-            if is_continuation and merged:
-                merged[-1]["DESCRICAO"] = (merged[-1]["DESCRICAO"] + " " + r["DESCRICAO"]).strip()
-            else:
-                merged.append(r)
-        rows = merged
+    # Só limpeza suave (sem normalizar números)
+    for r in raw_rows:
+        for k in r:
+            r[k] = " ".join(str(r[k]).replace("\n", " ").split())
 
-    return rows
+    return raw_rows
 
 
-def extract_table_full(file_bytes: bytes, unite_wrapped_description: bool = True) -> pd.DataFrame:
+def is_new_item(row: Dict[str, str]) -> bool:
     """
-    Percorre todas as páginas; em cada uma, detecta cabeçalho e extrai linhas.
+    Decide se a 'row' começa um novo item:
+    Regra: tem COD e NCM/SH preenchidos (característico da linha principal do item na DANFE).
     """
+    return bool(row.get("COD", "").strip()) and bool(row.get("NCM/SH", "").strip())
+
+
+def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    """
+    Consolida N linhas da DANFE em 1 item, preservando a descrição 'inteira'.
+    - Inicia novo item quando encontra (COD + NCM/SH).
+    - Linhas seguintes, até o próximo item, são tratadas como continuação.
+    - Em continuação, apenas DESCRICAO é agregada; campos estruturais só preenchem se o atual estiver vazio.
+    """
+    final_rows = []
+    current = None
+
+    for r in raw_rows:
+        if is_new_item(r):
+            if current:
+                final_rows.append(current)
+            current = {k: r.get(k, "").strip() for k in ["COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"]}
+            continue
+
+        # Continuação
+        if current:
+            # agrega apenas a descrição (sem quebrar linha)
+            if r.get("DESCRICAO", "").strip():
+                current["DESCRICAO"] = _append_text(current["DESCRICAO"], r["DESCRICAO"])
+            # se alguma coluna estrutural veio "perdida" e ainda está vazia no item atual, preenche
+            for col in ["CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"]:
+                if not current.get(col, "").strip() and r.get(col, "").strip():
+                    current[col] = r[col].strip()
+        else:
+            # Linha perdida antes do primeiro item (ignora)
+            continue
+
+    if current:
+        final_rows.append(current)
+
+    # limpeza final de espaços
+    for r in final_rows:
+        for k in r:
+            r[k] = " ".join(str(r[k]).split())
+    return final_rows
+
+
+def extract_table_full(file_bytes: bytes) -> pd.DataFrame:
+    """Extrai e consolida itens em todas as páginas."""
     out_rows = []
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         for p in doc:
-            page_rows = extract_table_page(p, unite_wrapped_description=unite_wrapped_description)
-            out_rows.extend(page_rows)
+            raw_rows = extract_table_page(p, unite_wrapped_description=True)
+            out_rows.extend(raw_rows)
 
-    df = pd.DataFrame(out_rows, columns=["COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"])
-    for c in df.columns:
-        df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-    # Remove linhas totalmente vazias
-    df = df[~(df == "").all(axis=1)].reset_index(drop=True)
+    items = consolidate_rows_into_items(out_rows)
+    df = pd.DataFrame(items, columns=["COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"])
     return df
 
 
 # ===============================
-# Organização / Normalização (opcional)
+# Organização para 6 colunas pedidas
 # ===============================
 RE_IT = re.compile(r"\bIT\s*\d{2,}\b", re.IGNORECASE)
-RE_NM = re.compile(r"\bNM\d{5,}\b", re.IGNORECASE)
+RE_NM = re.compile(r"\bNM\.?\s*(\d{5,})\b", re.IGNORECASE)
 
-def extract_it_nm(descricao: str) -> Tuple[Optional[str], Optional[str], str]:
+def extrair_item_unifilar(descricao: str) -> str:
+    m = RE_IT.search(descricao or "")
+    if m:
+        return m.group(0).upper().replace(" ", "")
+    return ""
+
+def extrair_nm(descricao: str) -> str:
+    m = RE_NM.search(descricao or "")
+    if m:
+        return m.group(1)
+    return ""
+
+def extrair_descricao_pos_nm(descricao: str) -> str:
     """
-    Extrai IT e NM do início da descrição quando existirem.
-    Retorna (IT, NM, descricao_sem_prefixos)
+    Retorna o 1º segmento descritivo após 'NM...' (quando houver).
+    Se não houver 'NM', retorna a descrição inteira já consolidada.
     """
     if not isinstance(descricao, str):
-        return None, None, descricao
-    it = None
-    nm = None
-    # captura primeira ocorrência
-    m_it = RE_IT.search(descricao)
-    m_nm = RE_NM.search(descricao)
-    # limpa prefixos ' - ' comuns
-    clean = descricao
-    if m_it:
-        it = m_it.group(0).upper()
-    if m_nm:
-        nm = m_nm.group(0).upper()
-    # Remove ambos do início se estiverem próximos
-    # Ex.: "IT180 - NM12773524 - VERTEBRA ..." -> "VERTEBRA ..."
-    lead = descricao
-    lead_upper = no_accents_upper(lead)
-    # corta até depois do primeiro " - " após NM/IT
-    first_sep = lead.find(" - ")
-    if first_sep != -1 and (m_it or m_nm) and (m_it and m_it.start() < 15 or m_nm and m_nm.start() < 15):
-        # tenta cortar até depois do segundo " - ", que é onde costuma iniciar a descrição
-        second_sep = lead.find(" - ", first_sep + 3)
-        if second_sep != -1:
-            clean = lead[second_sep + 3 :].strip()
-    return it, nm, clean
+        return ""
+    parts = [p.strip() for p in re.split(r"\s*-\s*", descricao)]
+    # procura o índice do trecho que contém NM...
+    idx_nm = None
+    for i, p in enumerate(parts):
+        if RE_NM.search(p):
+            idx_nm = i
+            break
+    if idx_nm is None:
+        return " ".join(parts).strip()
+    # descrição costuma iniciar após NM -> pegue o próximo bloco
+    if idx_nm + 1 < len(parts):
+        return parts[idx_nm + 1].strip()
+    return " ".join(parts).strip()
 
 
-def to_float_br(s: str) -> Optional[float]:
-    if not isinstance(s, str):
-        return None
-    s = s.strip()
-    if s == "":
-        return None
-    s = s.replace(".", "").replace(",", ".")
-    try:
-        return float(s)
-    except Exception:
-        return None
-
-
-def organize_table(
-    df_raw: pd.DataFrame,
-    extract_it_nm_flag: bool = True,
-    normalize_numbers_flag: bool = True
-) -> pd.DataFrame:
+def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
     """
-    A partir da tabela crua, gera colunas organizadas (opcionalmente IT, NM e numéricos).
-    Não remove nenhuma coluna ainda; só adiciona.
+    Mapeia para: Desenho, Item Unifilar, NM, Descrição, QTD, Unidade.
+    - Desenho  <- COD
+    - Item Unifilar <- IT extraído da DESCRICAO
+    - NM       <- NM extraído da DESCRICAO
+    - Descrição <- trecho após NM... (ou a própria DESCRICAO consolidada)
+    - QTD      <- QTD
+    - Unidade  <- UN
     """
-    df = df_raw.copy()
+    df = pd.DataFrame(columns=["Desenho", "Item Unifilar", "NM", "Descrição", "QTD", "Unidade"])
+    if df_itens.empty:
+        return df
 
-    if extract_it_nm_flag and "DESCRICAO" in df.columns:
-        its, nms, descrs = [], [], []
-        for x in df["DESCRICAO"].fillna(""):
-            it, nm, dclean = extract_it_nm(x)
-            its.append(it)
-            nms.append(nm)
-            descrs.append(dclean)
-        df["IT"] = its
-        df["NM"] = nms
-        df["DESCRICAO_LIMPA"] = descrs
+    desen = df_itens["COD"].fillna("").astype(str)
+    desc  = df_itens["DESCRICAO"].fillna("").astype(str)
+    qtd   = df_itens["QTD"].fillna("").astype(str)
+    un    = df_itens["UN"].fillna("").astype(str)
 
-    if normalize_numbers_flag:
-        for col in ["QTD", "V_UNITARIO", "V_TOTAL"]:
-            df[col + "_NUM"] = df[col].apply(to_float_br)
+    itcol = desc.apply(extrair_item_unifilar)
+    nmcol = desc.apply(extrair_nm)
+    desc_final = desc.apply(extrair_descricao_pos_nm)
 
-    # Ordena por IT numérico quando existir
-    if "IT" in df.columns:
-        df["_itnum"] = df["IT"].str.extract(r"(\d+)", expand=False)
-        df["_itnum"] = pd.to_numeric(df["_itnum"], errors="coerce")
-        df = df.sort_values(by=["_itnum"]).drop(columns=["_itnum"])
+    df["Desenho"] = desen
+    df["Item Unifilar"] = itcol
+    df["NM"] = nmcol
+    df["Descrição"] = desc_final
+    df["QTD"] = qtd
+    df["Unidade"] = un
 
+    # limpeza de espaços
+    for c in df.columns:
+        df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
     return df
 
 
 # ===============================
 # UI Streamlit
 # ===============================
-st.set_page_config(page_title="NF-e: Leitura exata + Organização de colunas", layout="wide")
-st.title("🧾 NF-e (DANFE) — Leitura EXATA da tabela + Organização")
+st.set_page_config(page_title="NF-e (DANFE) — Itens consolidados (sem quebra por linha)", layout="wide")
+st.title("🧾 NF-e (DANFE) — Extração por tabela, com LINHA ÚNICA por item")
 
 st.markdown(
     """
-1) **Lê a tabela exatamente como está** no PDF (pelo cabeçalho).  
-2) **Organiza** e deixa você **escolher quais colunas quer retornar** (e como renomear).  
-3) (Opcional) **Extrai IT/NM** e **normaliza números** (QTD / V. Unitário / V. Total).
+Este app:
+- Lê a tabela pelo **cabeçalho da DANFE**;
+- **Consolida** linhas quebradas para formar **uma linha por item** (descrição unificada, sem quebras);
+- Mostra também a visão **organizada** com as 6 colunas solicitadas: **Desenho, Item Unifilar, NM, Descrição, QTD, Unidade**.
 """
 )
 
 file = st.file_uploader("Selecione o PDF da DANFE", type=["pdf"])
-unir_quebras = st.checkbox("Unir linhas quebradas de descrição", value=True)
-extract_it_nm_flag = st.checkbox("Extrair IT/NM da descrição", value=True)
-normalize_numbers_flag = st.checkbox("Normalizar QTD / V. Unitário / V. Total (pt-BR → número)", value=True)
+btn = st.button("📤 Extrair")
 
-default_out_cols = [
-    "IT", "COD", "NM", "DESCRICAO_LIMPA",
-    "NCM/SH", "CFOP", "UN",
-    "QTD", "V_UNITARIO", "V_TOTAL",
-    "QTD_NUM", "V_UNITARIO_NUM", "V_TOTAL_NUM"
-]
-
-st.markdown("#### 3) Seleção das colunas de saída")
-selected_cols = st.multiselect(
-    "Escolha as colunas que deseja no resultado",
-    options=[
-        "IT", "NM", "COD", "DESCRICAO", "DESCRICAO_LIMPA",
-        "NCM/SH", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL",
-        "QTD_NUM", "V_UNITARIO_NUM", "V_TOTAL_NUM"
-    ],
-    default=default_out_cols
-)
-
-st.markdown("#### 4) Renomear colunas (opcional)")
-rename_map = {}
-if selected_cols:
-    cols1, cols2 = st.columns(2)
-    half = (len(selected_cols) + 1) // 2
-    with cols1:
-        for c in selected_cols[:half]:
-            new = st.text_input(f"Renomear '{c}' para:", value=c)
-            if new and new != c:
-                rename_map[c] = new
-    with cols2:
-        for c in selected_cols[half:]:
-            new = st.text_input(f"Renomear '{c}' para:", value=c)
-            if new and new != c:
-                rename_map[c] = new
-
-colA, colB = st.columns([1, 1])
-with colA:
-    btn_extract = st.button("📤 Extrair e Organizar")
-with colB:
-    auto_download = st.checkbox("Mostrar botões de download", value=True)
-
-if btn_extract and file is not None:
+if btn and file is not None:
     raw = file.read()
-    with st.spinner("Lendo tabela diretamente do PDF..."):
-        df_raw = extract_table_full(raw, unite_wrapped_description=unir_quebras)
+    with st.spinner("Lendo a tabela e consolidando itens..."):
+        df_items = extract_table_full(raw)
 
-    if df_raw.empty:
-        st.error("Não localizei a tabela de itens nesta DANFE. Me envie o PDF para calibrar o cabeçalho.")
+    if df_items.empty:
+        st.error("Não consegui localizar/consolidar a tabela de itens. Me envie o PDF para calibrarmos.")
     else:
-        st.success(f"Tabela crua capturada — linhas: {len(df_raw)}")
-        st.expander("Visualizar tabela CRUA (como está no PDF)").dataframe(df_raw, use_container_width=True, height=300)
+        st.success(f"Itens consolidados (uma linha por item): {len(df_items)}")
+        st.subheader("1) Itens consolidados (como na DANFE, sem quebras de linha)")
+        st.dataframe(df_items, use_container_width=True, height=420)
 
-        with st.spinner("Organizando colunas..."):
-            df_org = organize_table(
-                df_raw,
-                extract_it_nm_flag=extract_it_nm_flag,
-                normalize_numbers_flag=normalize_numbers_flag
+        # Export consolidados
+        col1, col2 = st.columns(2)
+        with col1:
+            csv_bytes = df_items.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 Baixar CSV (consolidados)", data=csv_bytes, file_name="itens_consolidados.csv", mime="text/csv")
+        with col2:
+            xls = io.BytesIO()
+            with pd.ExcelWriter(xls, engine="openpyxl") as w:
+                df_items.to_excel(w, index=False, sheet_name="Consolidados")
+            xls.seek(0)
+            st.download_button(
+                "📥 Baixar Excel (consolidados)",
+                data=xls,
+                file_name="itens_consolidados.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-            # Seleciona e renomeia
-            cols_final = [c for c in selected_cols if c in df_org.columns]
-            if not cols_final:
-                st.warning("Nenhuma coluna selecionada existe no dataframe. Verifique a seleção.")
-            else:
-                df_out = df_org[cols_final].rename(columns=rename_map)
+        st.subheader("2) Visão organizada (6 colunas pedidas)")
+        df6 = organizar_para_seis_colunas(df_items)
+        st.dataframe(df6, use_container_width=True, height=420)
 
-                st.subheader("Resultado final")
-                st.dataframe(df_out, use_container_width=True, height=420)
-
-                # Métrica de soma do total, se disponível
-                total_col = "V_TOTAL_NUM" if "V_TOTAL_NUM" in df_org.columns and "V_TOTAL_NUM" in cols_final else None
-                if total_col:
-                    soma_total = df_out[rename_map.get(total_col, total_col)].sum(skipna=True)
-                    st.metric("Soma do V. Total (numérico)", f"R$ {soma_total:,.2f}".replace(",", "X").replace(".", ",").replace("X", "."))
-
-                if auto_download:
-                    csv_bytes = df_out.to_csv(index=False).encode("utf-8-sig")
-                    st.download_button("📥 Baixar CSV (organizado)", data=csv_bytes, file_name="itens_nfe_organizado.csv", mime="text/csv")
-
-                    xls = io.BytesIO()
-                    with pd.ExcelWriter(xls, engine="openpyxl") as w:
-                        df_out.to_excel(w, index=False, sheet_name="Itens")
-                    xls.seek(0)
-                    st.download_button(
-                        "📥 Baixar Excel (organizado)",
-                        data=xls,
-                        file_name="itens_nfe_organizado.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
-
-st.markdown("---")
-st.caption("Caso você já saiba as colunas finais exatas, me diga quais são e eu fixo no código para sair direto do jeito que você precisa.")
+        # Export 6 colunas
+        col3, col4 = st.columns(2)
+        with col3:
+            csv6 = df6.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 Baixar CSV (6 colunas)", data=csv6, file_name="itens_6_colunas.csv", mime="text/csv")
+        with col4:
+            xls6 = io.BytesIO()
+            with pd.ExcelWriter(xls6, engine="openpyxl") as w:
+                df6.to_excel(w, index=False, sheet_name="6 colunas")
+            xls6.seek(0)
+            st.download_button(
+                "📥 Baixar Excel (6 colunas)",
+                data=xls6,
+                file_name="itens_6_colunas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
