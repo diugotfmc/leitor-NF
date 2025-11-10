@@ -1,23 +1,29 @@
 # -*- coding: utf-8 -*-
 import io
 import re
+import zipfile
 import unicodedata
 from typing import List, Tuple, Dict, Optional
 
 import streamlit as st
 import pandas as pd
 import fitz  # PyMuPDF
+from docx import Document
+from docx.shared import Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 
 
 # ===============================
-# Utilitários
+# --------- UTILITÁRIOS ---------
 # ===============================
 def no_accents_upper(s: str) -> str:
+    if s is None:
+        return ""
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
     return s.upper()
 
 
-def group_lines(words: List[Tuple[float, float, float, float, str]], tol_y: float = 2.0):
+def group_lines(words, tol_y: float = 2.0):
     """Agrupa palavras por linha (y)."""
     linhas = []
     cur_y = None
@@ -38,6 +44,33 @@ def group_lines(words: List[Tuple[float, float, float, float, str]], tol_y: floa
     return linhas
 
 
+def _append_text(base: str, extra: str) -> str:
+    """Une texto cuidando de hifenização e espaços."""
+    base = (base or "").rstrip()
+    extra = (extra or "").lstrip()
+    if base.endswith("-"):
+        return base[:-1] + extra
+    if base:
+        return base + " " + extra
+    return extra
+
+
+def to_float_br(s: str) -> Optional[float]:
+    if s is None:
+        return None
+    s = str(s).strip()
+    if s == "":
+        return None
+    s = s.replace(".", "").replace(",", ".")
+    try:
+        return float(s)
+    except Exception:
+        return None
+
+
+# ===============================
+# --- DETECÇÃO DO CABEÇALHO -----
+# ===============================
 END_MARKERS = [
     "DADOS ADICIONAIS",
     "INFORMACOES COMPLEMENTARES",
@@ -47,13 +80,9 @@ END_MARKERS = [
     "INFORMAÇÕES ADICIONAIS",
 ]
 
-
-# ===============================
-# Cabeçalho / colunas
-# ===============================
-def find_header_positions(lines: List[List[Tuple[float, float, float, float, str]]]) -> Optional[Dict[str, float]]:
+def find_header_positions(lines) -> Optional[Dict[str, float]]:
     """
-    Localiza o cabeçalho da tabela e retorna o x de cada coluna + y do header em "__y__".
+    Localiza o cabeçalho da tabela e retorna x de cada coluna + y do header em "__y__".
     Alvo: COD | DESCRICAO | NCM/SH | (CST?) | CFOP | UN | QTD | V_UNITARIO | V_TOTAL
     """
     for ln in lines:
@@ -73,25 +102,31 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
                 if nxt.startswith("PROD"):
                     col_x["COD"] = x0
 
+            # DESCRIÇÃO
             if t.startswith("DESCRICAO") or t.startswith("DESCRIÇÃO"):
                 col_x["DESCRICAO"] = x0
 
+            # NCM/SH
             if "NCM/SH" in t:
                 col_x["NCM/SH"] = x0
 
+            # CST (opcional)
             if t == "CST":
                 col_x["CST"] = x0
 
+            # CFOP
             if t == "CFOP":
                 col_x["CFOP"] = x0
 
+            # UN
             if t == "UN":
                 col_x["UN"] = x0
 
+            # QTD
             if t == "QTD":
                 col_x["QTD"] = x0
 
-            # V. UNITÁRIO / V. TOTAL (ou VALOR UNITÁRIO / VALOR TOTAL)
+            # V. UNITÁRIO / V. TOTAL (ou VALOR ...)
             if t in {"V.", "V"} and i + 1 < len(ln):
                 nxt = no_accents_upper(ln[i + 1][4])
                 if nxt.startswith("UNIT"):
@@ -105,16 +140,14 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
                 if nxt.startswith("TOTAL"):
                     col_x["V_TOTAL"] = x0
 
-        have = set(col_x.keys())
-        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}  # CST é opcional
-        if len(have.intersection(need)) >= 6:
+        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}
+        if len(set(col_x.keys()).intersection(need)) >= 6:
             col_x["__y__"] = ln[0][1]
             return col_x
     return None
 
 
-def build_column_edges(col_x: Dict[str, float], page_width: float) -> List[Tuple[str, float, float]]:
-    """Gera intervalos [x_ini, x_fim) para as colunas encontradas no header."""
+def build_column_edges(col_x: Dict[str, float], page_width: float):
     keys_pref = ["COD", "DESCRICAO", "NCM/SH", "CST", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"]
     keys = [k for k in keys_pref if k in col_x]
     keys.sort(key=lambda k: col_x[k])
@@ -128,28 +161,80 @@ def build_column_edges(col_x: Dict[str, float], page_width: float) -> List[Tuple
 
 
 # ===============================
-# Extração por página (linhas cruas)
+# --- EXTRAÇÃO DE ITENS ----------
 # ===============================
-def _append_text(base: str, extra: str) -> str:
-    """Une texto cuidando de hifenização e espaços."""
-    base = base.rstrip()
-    extra = extra.lstrip()
-    if base.endswith("-"):
-        return base[:-1] + extra
-    if base:
-        return base + " " + extra
-    return extra
+def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], Optional[str], str]:
+    """
+    (chave_44, numero_nf_9, texto_p1)
+    - Tenta pegar "CHAVE DE ACESSO" -> 44 dígitos; extrai nNF (pos 26-34 1-based => 25..34 0-based).
+    - Fallback: padrão textual "Nº 000000000".
+    - Retorna também o texto bruto da página 1 (para buscar PROJETO/RT).
+    """
+    try:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                return None, None, ""
+            txt = doc[0].get_text("text")
+            upper = txt.upper()
+
+            key = None
+            pos = upper.find("CHAVE DE ACESSO")
+            if pos != -1:
+                tail = upper[pos:pos + 300]
+                digits = re.findall(r"\d", tail)
+                if len(digits) >= 44:
+                    key = "".join(digits[:44])
+
+            if not key:
+                # fallback grosseiro: 44 dígitos em bloco
+                m = re.search(r"\b\d[\d\s]{42,}\d\b", upper)
+                if m:
+                    only = re.findall(r"\d", m.group(0))
+                    if len(only) >= 44:
+                        key = "".join(only[:44])
+
+            nf = None
+            if key and len(key) == 44:
+                nf = key25:34[1]()  # nNF (9 dígitos)
+
+            if not nf:
+                m = re.search(r"\bN[º°O\.]?\s*([0-9]{1,9})\b", upper)
+                if m:
+                    nf = m.group(1).zfill(9)
+
+            return key, nf, txt
+    except Exception:
+        return None, None, ""
+
+
+def sniff_projeto_rt(texto_primeira_pagina: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Procura 'PROJETO <algo>' e 'RT <algo>' no texto bruto.
+    Retorna (projeto, rt) ou (None, None) se não achar.
+    """
+    up = no_accents_upper(texto_primeira_pagina)
+    projeto = None
+    rt = None
+
+    mproj = re.search(r"\bPROJETO\s*([A-Z0-9\-_/\.]+)", up)
+    if mproj:
+        projeto = mproj.group(1).strip(" .;,")
+
+    # RT pode aparecer como "RT: 123", "RT 123", "REQUISIÇÃO DE TRANSPORTE <RT>" etc.
+    mrt = re.search(r"\bRT[:\s\-]*([A-Z0-9\-_/\.]+)", up)
+    if mrt:
+        rt = mrt.group(1).strip(" .;,")
+
+    return projeto, rt
 
 
 def extract_table_page(page) -> List[Dict[str, str]]:
     """
-    Mapeia palavras -> colunas via cabeçalho desta página.
-    Retorna 'linhas cruas' (cada linha visual, sem consolidação por item ainda).
+    Extrai linhas cruas (cada linha visual) mapeando palavras -> colunas via cabeçalho.
     """
     words = page.get_text("words")
     words = [(w[0], w[1], w[2], w[3], w[4]) for w in words]
     words.sort(key=lambda t: (round(t[1], 1), t[0]))
-
     lines = group_lines(words, tol_y=2.0)
     if not lines:
         return []
@@ -188,18 +273,13 @@ def extract_table_page(page) -> List[Dict[str, str]]:
             if not placed:
                 row["DESCRICAO"] = _append_text(row.get("DESCRICAO", ""), t)
 
-        # limpeza leve
         for k in row:
             row[k] = " ".join(str(row[k]).replace("\n", " ").split())
-
         raw_rows.append(row)
 
     return raw_rows
 
 
-# ===============================
-# Consolidação + sanitização NCM/CST/CFOP
-# ===============================
 def is_new_item(row: Dict[str, str]) -> bool:
     """Novo item quando a linha traz COD e NCM/SH visivelmente preenchidos."""
     return bool(row.get("COD", "").strip()) and bool(row.get("NCM/SH", "").strip())
@@ -207,8 +287,7 @@ def is_new_item(row: Dict[str, str]) -> bool:
 
 def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[str, str, str]:
     """
-    Devolve (NCM8, CST3, CFOP4) limpos a partir dos textos crus.
-    Regra: tokeniza dígitos e pega nessa ordem: 8 -> 3 -> 4. Depois fallbacks por coluna.
+    (NCM8, CST3, CFOP4) a partir de textos crus — ordem: 8 -> 3 -> 4 (com fallbacks).
     """
     def tokens_digits(s: str) -> List[str]:
         return [t for t in re.split(r"\D+", s or "") if t]
@@ -246,9 +325,6 @@ def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[st
 def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
     Consolida N linhas em 1 item (descrição unificada).
-    - Inicia novo item com (COD + NCM/SH).
-    - Linhas seguintes agregam DESCRICAO até o próximo item.
-    - Sanitiza NCM/SH (8 dígitos), CST (3 dígitos) e CFOP (4 dígitos).
     """
     final_rows = []
     current = None
@@ -267,12 +343,9 @@ def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str
         if current:
             if r.get("DESCRICAO", "").strip():
                 current["DESCRICAO"] = _append_text(current["DESCRICAO"], r["DESCRICAO"])
-            # completa campos estruturais apenas se ainda vazios no item
             for col in ["CST", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL", "NCM/SH"]:
                 if not current.get(col, "").strip() and r.get(col, "").strip():
                     current[col] = r[col].strip()
-        else:
-            continue
 
     if current:
         ncm, cst, cfop = parse_ncm_cst_cfop(current.get("NCM/SH", ""), current.get("CST", ""), current.get("CFOP", ""))
@@ -287,219 +360,264 @@ def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str
     return final_rows
 
 
-def extract_items_dataframe(file_bytes: bytes) -> pd.DataFrame:
-    """Extrai de todas as páginas e devolve uma linha por item (NCM/SH, CST, CFOP saneados)."""
+def extract_items_from_pdf(file_bytes: bytes) -> pd.DataFrame:
+    """Extrai itens (linha única por item) desta DANFE."""
     out_rows = []
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
         for p in doc:
             raw_rows = extract_table_page(p)
             out_rows.extend(raw_rows)
-
     items = consolidate_rows_into_items(out_rows)
     df = pd.DataFrame(items, columns=["COD", "DESCRICAO", "NCM/SH", "CST", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL"])
     return df
 
 
 # ===============================
-# Nº da NF e Chave de Acesso
+# --- CAMPOS MÁSCARA 1–23 -------
 # ===============================
-def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Retorna (chave_44, numero_nf_9) a partir da 1ª página.
-    Preferência: "CHAVE DE ACESSO" -> 44 dígitos; nNF = pos. 26..34 (1-based) => [25:34] (0-based).
-    Fallback: regex "Nº 000000000".
-    """
-    try:
-        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
-            if len(doc) == 0:
-                return None, None
-            txt = doc[0].get_text("text")
-            upper = txt.upper()
+MASK_FIELDS = [
+    "1-", "2-DOCUMENTO DE CHEGADA", "3-MATERIAL", "4-NOTA PETROBRAS", "5-NOTA DE SAÍDA BASE",
+    "6-NOTA DE SAÍDA PETROBRAS", "7-N° DE CSP", "8-PROJETO", "9-RT", "10-MATERIAL INVENTARIADO",
+    "11-FERRAMENTA", "12-TAG BCDS DA FERRAMENTA", "13-NM", "14-CENTRO", "15-DESENHO",
+    "16-IMOBILIZADO", "17-QUANTIDADE", "18-N° DE CAIXA", "19-DIAGRAMA DE REDE / ELEMENTO PEP",
+    "20-PTM", "21-DSM", "22-NOTA DE TRANSF. MAR", "23-PROTOCOLO"
+]
 
-            key = None
-            pos = upper.find("CHAVE DE ACESSO")
-            if pos != -1:
-                tail = upper[pos:pos + 300]
-                digits = re.findall(r"\d", tail)
-                if len(digits) >= 44:
-                    key = "".join(digits[:44])
-
-            if not key:
-                # fallback tentando achar 44 dígitos próximos em todo o cabeçalho
-                m = re.search(r"(?:\D*\d){44}", upper)  # padrão permissivo
-                if m:
-                    only_digits = re.findall(r"\d", m.group(0))
-                    if len(only_digits) >= 44:
-                        key = "".join(only_digits[:44])
-
-            nf = None
-            if key and len(key) == 44:
-                nf = key[25:34]  # 9 dígitos
-
-            if not nf:
-                m = re.search(r"\bN[º°o\.]?\s*([0-9]{1,9})\b", upper)
-                if m:
-                    nf = m.group(1).zfill(9)
-
-            return key, nf
-    except Exception:
-        return None, None
-
-
-# ===============================
-# Organização nas 6 colunas pedidas
-# ===============================
 RE_IT = re.compile(r"\bIT\s*\d{2,}\b", re.IGNORECASE)
-RE_NM_NUM = re.compile(r"\bNM\.?\s*(\d{5,})\b", re.IGNORECASE)
+RE_NM = re.compile(r"\bNM\.?\s*(\d{5,})\b", re.IGNORECASE)
 
 def extrair_item_unifilar(descricao: str) -> str:
     m = RE_IT.search(descricao or "")
     return m.group(0).upper().replace(" ", "") if m else ""
 
 def extrair_nm(descricao: str) -> str:
-    m = RE_NM_NUM.search(descricao or "")
+    m = RE_NM.search(descricao or "")
     return m.group(1) if m else ""
 
-def extrair_descricao_pos_nm(descricao: str) -> str:
+
+def build_mask_defaults(nf_num: str,
+                        chave: str,
+                        projeto_hint: Optional[str],
+                        rt_hint: Optional[str],
+                        item_row: pd.Series) -> Dict[str, str]:
     """
-    Retorna o 1º segmento descritivo após 'NM...' (quando houver).
-    Se não houver 'NM', retorna a descrição consolidada inteira.
+    Gera um dicionário com os 23 campos já pré-preenchidos quando possível.
     """
-    if not isinstance(descricao, str):
-        return ""
-    parts = [p.strip() for p in re.split(r"\s*-\s*", descricao)]
-    idx_nm = None
-    for i, p in enumerate(parts):
-        if RE_NM_NUM.search(p):
-            idx_nm = i
-            break
-    if idx_nm is None:
-        return " ".join(parts).strip()
-    if idx_nm + 1 < len(parts):
-        return parts[idx_nm + 1].strip()
-    return " ".join(parts).strip()
+    desc = str(item_row.get("DESCRICAO", "") or "")
+    nm = extrair_nm(desc)
+    desenho = str(item_row.get("COD", "") or "")
+    qtd = str(item_row.get("QTD", "") or "")
+    vunit = str(item_row.get("V_UNITARIO", "") or "")
+
+    # Você pode ajustar os defaults abaixo conforme seu processo
+    defaults = {
+        "1-": "",
+        "2-DOCUMENTO DE CHEGADA": f"DANFE NF {nf_num}" if nf_num else "DANFE",
+        "3-MATERIAL": desc,
+        "4-NOTA PETROBRAS": nf_num or "",
+        "5-NOTA DE SAÍDA BASE": "N/A",
+        "6-NOTA DE SAÍDA PETROBRAS": "N/A",
+        "7-N° DE CSP": "",
+        "8-PROJETO": projeto_hint or "",
+        "9-RT": rt_hint or "N/A",
+        "10-MATERIAL INVENTARIADO": "",
+        "11-FERRAMENTA": "NÃO",
+        "12-TAG BCDS DA FERRAMENTA": "N/A",
+        "13-NM": nm,
+        "14-CENTRO": "",
+        "15-DESENHO": desenho if desenho else "N/A",
+        "16-IMOBILIZADO": "N/A",
+        "17-QUANTIDADE": qtd,
+        "18-N° DE CAIXA": "N/A",
+        "19-DIAGRAMA DE REDE / ELEMENTO PEP": "N/A",
+        "20-PTM": "N/A",
+        "21-DSM": "N/A",
+        "22-NOTA DE TRANSF. MAR": "N/A",
+        "23-PROTOCOLO": "N/A",
+    }
+    return defaults
 
 
-def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
+def render_mask_docx(mask_dict: Dict[str, str]) -> bytes:
     """
-    NF, Desenho, Item Unifilar, NM, Descrição, QTD, Unidade.
+    Gera um DOCX com os 23 campos numerados.
     """
-    cols = ["NF", "Desenho", "Item Unifilar", "NM", "Descrição", "QTD", "Unidade"]
-    df = pd.DataFrame(columns=cols)
-    if df_itens.empty:
-        return df
+    doc = Document()
+    # Título
+    title = doc.add_paragraph("MÁSCARA DE ENVIO — ITENS NF")
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title.runs[0].bold = True
+    title.runs[0].font.size = Pt(14)
 
-    desen = df_itens["COD"].fillna("").astype(str)
-    desc  = df_itens["DESCRICAO"].fillna("").astype(str)
-    qtd   = df_itens["QTD"].fillna("").astype(str)
-    un    = df_itens["UN"].fillna("").astype(str)
-    nf    = df_itens["NF"].fillna("").astype(str)
+    doc.add_paragraph("")  # espaço
 
-    df["NF"] = nf
-    df["Desenho"] = desen
-    df["Item Unifilar"] = desc.apply(extrair_item_unifilar)
-    df["NM"] = desc.apply(extrair_nm)
-    df["Descrição"] = desc.apply(extrair_descricao_pos_nm)
-    df["QTD"] = qtd
-    df["Unidade"] = un
+    for field in MASK_FIELDS:
+        value = mask_dict.get(field, "")
+        p = doc.add_paragraph()
+        run1 = p.add_run(f"{field} ")
+        run1.bold = True
+        run1.font.size = Pt(11)
 
-    for c in df.columns:
-        df[c] = df[c].astype(str).str.replace(r"\s+", " ", regex=True).str.strip()
-    return df
+        run2 = p.add_run(value)
+        run2.font.size = Pt(11)
+
+    bio = io.BytesIO()
+    doc.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
+
+
+def render_mask_xlsx(mask_dict: Dict[str, str]) -> bytes:
+    """
+    Gera um XLSX com uma linha e as 23 colunas (campos).
+    """
+    df = pd.DataFrame([{k: mask_dict.get(k, "") for k in MASK_FIELDS}])
+    out = io.BytesIO()
+    with pd.ExcelWriter(out, engine="openpyxl") as w:
+        df.to_excel(w, index=False, sheet_name="Mascara")
+    out.seek(0)
+    return out.getvalue()
 
 
 # ===============================
-# UI Streamlit
+# --------- INTERFACE -----------
 # ===============================
-st.set_page_config(page_title="NF-e (DANFE) — Multi-upload com NF + NCM/SH/CST/CFOP saneados", layout="wide")
-st.title("🧾 NF-e (DANFE) — Várias notas + NF por item + NCM/SH/CST/CFOP saneados")
+st.set_page_config(page_title="Coletor de Campos da NF + Geração de Máscara", layout="wide")
+st.title("🧾 Coletor de NFs → Preenchimento de Máscara (1–23)")
 
 st.markdown(
     """
-Carregue **uma ou mais** DANFEs. O app:
-- Lê a tabela (pelo **cabeçalho**), consolidando **uma linha por item**;
-- Saneia **NCM/SH (8 dígitos)**, **CST (3 dígitos)**, **CFOP (4 dígitos)**;
-- Extrai **Chave de Acesso** e o **nº da NF** (coluna **NF**) do cabeçalho;
-- Mostra:
-  1) **Itens consolidados** (com NF, Arquivo, Chave, NCM/SH, CST, CFOP, etc.);
-  2) **Visão organizada** com **NF, Desenho, Item Unifilar, NM, Descrição, QTD, Unidade**;
-- Exporta CSV/XLSX.
+**Fluxo sugerido**  
+1. Faça **upload** de **uma ou mais DANFEs (PDF)**;  
+2. O app extrai **itens consolidados** (uma linha por item) e **dados do cabeçalho** (Nº NF, Chave, PROJETO/RT se houver);  
+3. Selecione o **item** e revise/edite os **23 campos**;  
+4. **Baixe a máscara** preenchida em **DOCX** e/ou **XLSX** (ou gere em **lote** para vários itens).
 """
 )
 
-files = st.file_uploader("Selecione um ou mais PDFs da DANFE", type=["pdf"], accept_multiple_files=True)
-btn = st.button("📤 Extrair")
+files = st.file_uploader("Selecione uma ou mais DANFEs (PDF)", type=["pdf"], accept_multiple_files=True)
 
-if btn and files:
-    all_items = []
+if files:
+    # Extração de todas as NFs
+    all_rows = []
+    per_nf_meta = {}  # nf_number -> (chave, projeto, rt)
+
     for f in files:
-        file_bytes = f.read()
+        fbytes = f.read()
+        chave, nf_num, txt_p1 = extract_access_key_and_nf_number(fbytes)
+        projeto_hint, rt_hint = sniff_projeto_rt(txt_p1)
+        nf_label = nf_num if nf_num else "NF_DESCONHECIDA"
 
-        # Extrai Chave de Acesso e Nº da NF
-        chave, nf = extract_access_key_and_nf_number(file_bytes)
-        nf_label = nf if nf else "NF_DESCONHECIDA"
-
-        # Extrai itens (consolidados) desta NF
-        with st.spinner(f"Lendo itens da NF {nf_label} ({f.name})..."):
-            df_items = extract_items_dataframe(file_bytes)
-
+        df_items = extract_items_from_pdf(fbytes)
         if df_items.empty:
-            st.warning(f"⚠️ Não encontrei itens na NF {nf_label} ({f.name}).")
+            st.warning(f"⚠️ Nenhum item encontrado: {f.name}")
             continue
 
-        # Anexa colunas de identificação da NF
         df_items.insert(0, "NF", nf_label)
         df_items.insert(1, "Arquivo", f.name)
         df_items.insert(2, "Chave_Acesso", chave or "")
 
-        all_items.append(df_items)
+        all_rows.append(df_items)
+        per_nf_meta[nf_label] = (chave or "", nf_label, projeto_hint, rt_hint)
 
-    if not all_items:
-        st.error("Nenhuma NF válida encontrada.")
-    else:
-        df_all = pd.concat(all_items, ignore_index=True)
+    if not all_rows:
+        st.stop()
 
-        st.success(f"Notas processadas: {len(all_items)} — Itens totais: {len(df_all)}")
+    df_all = pd.concat(all_rows, ignore_index=True)
 
-        st.subheader("1) Itens consolidados (com NF / Chave / NCM/SH / CST / CFOP)")
-        st.dataframe(df_all, use_container_width=True, height=420)
+    st.success(f"NF(s) processadas: {df_all['NF'].nunique()} • Itens extraídos: {len(df_all)}")
+    st.dataframe(df_all, use_container_width=True, height=420)
 
-        # Exports consolidados
-        c1, c2 = st.columns(2)
-        with c1:
-            csv_bytes = df_all.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 CSV (consolidados + NF)", data=csv_bytes, file_name="itens_consolidados_multi_nf.csv", mime="text/csv")
-        with c2:
-            xls = io.BytesIO()
-            with pd.ExcelWriter(xls, engine="openpyxl") as w:
-                df_all.to_excel(w, index=False, sheet_name="Consolidados")
-            xls.seek(0)
-            st.download_button(
-                "📥 Excel (consolidados + NF)",
-                data=xls,
-                file_name="itens_consolidados_multi_nf.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    # ===============================
+    # Seleção de item único
+    # ===============================
+    st.markdown("### Selecionar **um item** para preencher a máscara")
+    colNF, colIdx = st.columns([1, 2])
 
-        st.subheader("2) Visão organizada (NF + 6 colunas pedidas)")
-        df6_parts = []
-        for _, df_nf in df_all.groupby("NF", sort=False):
-            df6_parts.append(organizar_para_seis_colunas(df_nf))
-        df6_all = pd.concat(df6_parts, ignore_index=True)
-        st.dataframe(df6_all, use_container_width=True, height=420)
+    with colNF:
+        sel_nf = st.selectbox("NF", sorted(df_all["NF"].unique()))
+    with colIdx:
+        # opções do item daquela NF (mostra uma string amigável)
+        df_nf = df_all[df_all["NF"] == sel_nf].reset_index(drop=True)
+        opts = [
+            f"#{i+1} • COD={row['COD']} • QTD={row['QTD']} • UN={row['UN']} • DESC={row['DESCRICAO'][:60]}..."
+            for i, row in df_nf.iterrows()
+        ]
+        sel_idx = st.selectbox("Item da NF", options=list(range(len(df_nf))), format_func=lambda i: opts[i])
 
-        c3, c4 = st.columns(2)
-        with c3:
-            csv6 = df6_all.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 CSV (NF + 6 colunas)", data=csv6, file_name="itens_nf_6colunas_multi.csv", mime="text/csv")
-        with c4:
-            xls6 = io.BytesIO()
-            with pd.ExcelWriter(xls6, engine="openpyxl") as w:
-                df6_all.to_excel(w, index=False, sheet_name="NF + 6 colunas")
-            xls6.seek(0)
-            st.download_button(
-                "📥 Excel (NF + 6 colunas)",
-                data=xls6,
-                file_name="itens_nf_6colunas_multi.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
+    # Pré-preenche máscara
+    chave, nf_num, projeto_hint, rt_hint = per_nf_meta.get(sel_nf, ("", sel_nf, None, None))
+    default_mask = build_mask_defaults(nf_num, chave, projeto_hint, rt_hint, df_nf.loc[sel_idx])
+
+    st.markdown("#### Revisar/editar campos da **máscara**")
+    # Formulário em duas colunas
+    form_cols = st.columns(2)
+    mask_vals = {}
+    for i, field in enumerate(MASK_FIELDS):
+        col = form_cols[i % 2]
+        with col:
+            mask_vals[field] = st.text_input(field, value=default_mask.get(field, ""))
+
+    # Botões de saída
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        if st.button("📄 Gerar DOCX (este item)"):
+            doc_bytes = render_mask_docx(mask_vals)
+            st.download_button("⬇️ Baixar DOCX", data=doc_bytes, file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    with c2:
+        if st.button("📊 Gerar XLSX (este item)"):
+            xls_bytes = render_mask_xlsx(mask_vals)
+            st.download_button("⬇️ Baixar XLSX", data=xls_bytes, file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.markdown("---")
+
+    # ===============================
+    # Geração em LOTE (vários itens)
+    # ===============================
+    st.markdown("### Geração **em lote** (vários itens → ZIP)")
+    # Filtros de lote
+    lote_nf = st.multiselect("Filtrar por NF (opcional)", options=sorted(df_all["NF"].unique()), default=sorted(df_all["NF"].unique()))
+    df_lote = df_all[df_all["NF"].isin(lote_nf)].reset_index(drop=True)
+    st.caption(f"Itens selecionáveis: {len(df_lote)}")
+    sel_rows = st.multiselect(
+        "Escolha os itens para gerar em lote (por índice da tabela abaixo)",
+        options=list(df_lote.index),
+        format_func=lambda i: f"[{i}] NF={df_lote.loc[i,'NF']} • COD={df_lote.loc[i,'COD']} • QTD={df_lote.loc[i,'QTD']} • {df_lote.loc[i,'DESCRICAO'][:40]}..."
+    )
+    st.dataframe(df_lote, use_container_width=True, height=320)
+
+    czip1, czip2 = st.columns(2)
+    with czip1:
+        if st.button("🧷 Gerar ZIP de **DOCX**"):
+            if not sel_rows:
+                st.warning("Selecione ao menos um item.")
+            else:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for i in sel_rows:
+                        row = df_lote.loc[i]
+                        chave, nf_num, projeto_hint, rt_hint = per_nf_meta.get(row["NF"], ("", row["NF"], None, None))
+                        defaults = build_mask_defaults(nf_num, chave, projeto_hint, rt_hint, row)
+                        doc_bytes = render_mask_docx(defaults)
+                        fname = f"mascara_{row['NF']}_{row['COD']}.docx"
+                        zf.writestr(fname, doc_bytes)
+                zip_buf.seek(0)
+                st.download_button("⬇️ Baixar ZIP (DOCX)", data=zip_buf.getvalue(), file_name="mascaras_docx.zip", mime="application/zip")
+    with czip2:
+        if st.button("🧷 Gerar ZIP de **XLSX**"):
+            if not sel_rows:
+                st.warning("Selecione ao menos um item.")
+            else:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                    for i in sel_rows:
+                        row = df_lote.loc[i]
+                        chave, nf_num, projeto_hint, rt_hint = per_nf_meta.get(row["NF"], ("", row["NF"], None, None))
+                        defaults = build_mask_defaults(nf_num, chave, projeto_hint, rt_hint, row)
+                        xls_bytes = render_mask_xlsx(defaults)
+                        fname = f"mascara_{row['NF']}_{row['COD']}.xlsx"
+                        zf.writestr(fname, xls_bytes)
+                zip_buf.seek(0)
+                st.download_button("⬇️ Baixar ZIP (XLSX)", data=zip_buf.getvalue(), file_name="mascaras_xlsx.zip", mime="application/zip")
+else:
+    st.info("Envie ao menos uma DANFE (PDF) para iniciar.")
