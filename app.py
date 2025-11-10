@@ -186,7 +186,7 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
                     key = "".join(digits[:44])
 
             if not key:
-                # fallback grosseiro: 44 dígitos em bloco
+                # fallback: 44 dígitos em bloco no cabeçalho
                 m = re.search(r"\b\d[\d\s]{42,}\d\b", upper)
                 if m:
                     only = re.findall(r"\d", m.group(0))
@@ -195,7 +195,8 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
 
             nf = None
             if key and len(key) == 44:
-                nf = key25:341  # nNF (9 dígitos)
+                # 0-based slice para 9 dígitos
+                nf = key[25:34]
 
             if not nf:
                 m = re.search(r"\bN[º°O\.]?\s*([0-9]{1,9})\b", upper)
@@ -208,10 +209,7 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
 
 
 def sniff_projeto_rt(texto_primeira_pagina: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Procura 'PROJETO <algo>' e 'RT <algo>' no texto bruto.
-    Retorna (projeto, rt) ou (None, None) se não achar.
-    """
+    """Heurística simples para PROJETO e RT no texto do cabeçalho/compl."""
     up = no_accents_upper(texto_primeira_pagina)
     projeto = None
     rt = None
@@ -220,7 +218,6 @@ def sniff_projeto_rt(texto_primeira_pagina: str) -> Tuple[Optional[str], Optiona
     if mproj:
         projeto = mproj.group(1).strip(" .;,")
 
-    # RT pode aparecer como "RT: 123", "RT 123", "REQUISIÇÃO DE TRANSPORTE <RT>" etc.
     mrt = re.search(r"\bRT[:\s\-]*([A-Z0-9\-_/\.]+)", up)
     if mrt:
         rt = mrt.group(1).strip(" .;,")
@@ -324,7 +321,7 @@ def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[st
 
 def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
     """
-    Consolida N linhas em 1 item (descrição unificada).
+    Consolida N linhas em 1 item (descrição unificada), saneando NCM/SH, CST e CFOP.
     """
     final_rows = []
     current = None
@@ -343,6 +340,7 @@ def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str
         if current:
             if r.get("DESCRICAO", "").strip():
                 current["DESCRICAO"] = _append_text(current["DESCRICAO"], r["DESCRICAO"])
+            # completa campos estruturais apenas se ainda vazios no item
             for col in ["CST", "CFOP", "UN", "QTD", "V_UNITARIO", "V_TOTAL", "NCM/SH"]:
                 if not current.get(col, "").strip() and r.get(col, "").strip():
                     current[col] = r[col].strip()
@@ -376,11 +374,29 @@ def extract_items_from_pdf(file_bytes: bytes) -> pd.DataFrame:
 # --- CAMPOS MÁSCARA 1–23 -------
 # ===============================
 MASK_FIELDS = [
-    "1-", "2-DOCUMENTO DE CHEGADA", "3-MATERIAL", "4-NOTA PETROBRAS", "5-NOTA DE SAÍDA BASE",
-    "6-NOTA DE SAÍDA PETROBRAS", "7-N° DE CSP", "8-PROJETO", "9-RT", "10-MATERIAL INVENTARIADO",
-    "11-FERRAMENTA", "12-TAG BCDS DA FERRAMENTA", "13-NM", "14-CENTRO", "15-DESENHO",
-    "16-IMOBILIZADO", "17-QUANTIDADE", "18-N° DE CAIXA", "19-DIAGRAMA DE REDE / ELEMENTO PEP",
-    "20-PTM", "21-DSM", "22-NOTA DE TRANSF. MAR", "23-PROTOCOLO"
+    "1-",
+    "2-DOCUMENTO DE CHEGADA",
+    "3-MATERIAL",
+    "4-NOTA PETROBRAS",
+    "5-NOTA DE SAÍDA BASE",
+    "6-NOTA DE SAÍDA PETROBRAS",
+    "7-N° DE CSP",
+    "8-PROJETO",
+    "9-RT",
+    "10-MATERIAL INVENTARIADO",
+    "11-FERRAMENTA",
+    "12-TAG BCDS DA FERRAMENTA",
+    "13-NM",
+    "14-CENTRO",
+    "15-DESENHO",
+    "16-IMOBILIZADO",
+    "17-QUANTIDADE",
+    "18-N° DE CAIXA",
+    "19-DIAGRAMA DE REDE / ELEMENTO PEP",
+    "20-PTM",
+    "21-DSM",
+    "22-NOTA DE TRANSF. MAR",
+    "23-PROTOCOLO"
 ]
 
 RE_IT = re.compile(r"\bIT\s*\d{2,}\b", re.IGNORECASE)
@@ -407,9 +423,7 @@ def build_mask_defaults(nf_num: str,
     nm = extrair_nm(desc)
     desenho = str(item_row.get("COD", "") or "")
     qtd = str(item_row.get("QTD", "") or "")
-    vunit = str(item_row.get("V_UNITARIO", "") or "")
 
-    # Você pode ajustar os defaults abaixo conforme seu processo
     defaults = {
         "1-": "",
         "2-DOCUMENTO DE CHEGADA": f"DANFE NF {nf_num}" if nf_num else "DANFE",
@@ -439,11 +453,8 @@ def build_mask_defaults(nf_num: str,
 
 
 def render_mask_docx(mask_dict: Dict[str, str]) -> bytes:
-    """
-    Gera um DOCX com os 23 campos numerados.
-    """
+    """Gera um DOCX com os 23 campos numerados."""
     doc = Document()
-    # Título
     title = doc.add_paragraph("MÁSCARA DE ENVIO — ITENS NF")
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     title.runs[0].bold = True
@@ -468,9 +479,7 @@ def render_mask_docx(mask_dict: Dict[str, str]) -> bytes:
 
 
 def render_mask_xlsx(mask_dict: Dict[str, str]) -> bytes:
-    """
-    Gera um XLSX com uma linha e as 23 colunas (campos).
-    """
+    """Gera um XLSX com uma linha e as 23 colunas."""
     df = pd.DataFrame([{k: mask_dict.get(k, "") for k in MASK_FIELDS}])
     out = io.BytesIO()
     with pd.ExcelWriter(out, engine="openpyxl") as w:
@@ -482,16 +491,16 @@ def render_mask_xlsx(mask_dict: Dict[str, str]) -> bytes:
 # ===============================
 # --------- INTERFACE -----------
 # ===============================
-st.set_page_config(page_title="Coletor de Campos da NF + Geração de Máscara", layout="wide")
+st.set_page_config(page_title="Coletor de NFs → Máscara (1–23)", layout="wide")
 st.title("🧾 Coletor de NFs → Preenchimento de Máscara (1–23)")
 
 st.markdown(
     """
-**Fluxo sugerido**  
-1. Faça **upload** de **uma ou mais DANFEs (PDF)**;  
-2. O app extrai **itens consolidados** (uma linha por item) e **dados do cabeçalho** (Nº NF, Chave, PROJETO/RT se houver);  
-3. Selecione o **item** e revise/edite os **23 campos**;  
-4. **Baixe a máscara** preenchida em **DOCX** e/ou **XLSX** (ou gere em **lote** para vários itens).
+**Fluxo**  
+1) Suba **uma ou mais DANFEs (PDF)**;  
+2) O app extrai **itens consolidados** (uma linha por item) e **dados do cabeçalho** (Nº NF, Chave, PROJETO/RT);  
+3) Selecione o **item**, revise/edite a **máscara**;  
+4) Baixe **DOCX/XLSX** (ou **ZIP** em lote).
 """
 )
 
@@ -500,7 +509,7 @@ files = st.file_uploader("Selecione uma ou mais DANFEs (PDF)", type=["pdf"], acc
 if files:
     # Extração de todas as NFs
     all_rows = []
-    per_nf_meta = {}  # nf_number -> (chave, projeto, rt)
+    per_nf_meta = {}  # nf_number -> (chave, nf, projeto, rt)
 
     for f in files:
         fbytes = f.read()
@@ -537,7 +546,6 @@ if files:
     with colNF:
         sel_nf = st.selectbox("NF", sorted(df_all["NF"].unique()))
     with colIdx:
-        # opções do item daquela NF (mostra uma string amigável)
         df_nf = df_all[df_all["NF"] == sel_nf].reset_index(drop=True)
         opts = [
             f"#{i+1} • COD={row['COD']} • QTD={row['QTD']} • UN={row['UN']} • DESC={row['DESCRICAO'][:60]}..."
@@ -545,7 +553,7 @@ if files:
         ]
         sel_idx = st.selectbox("Item da NF", options=list(range(len(df_nf))), format_func=lambda i: opts[i])
 
-    # Pré-preenche máscara
+    # Pré-preenche máscara com defaults
     chave, nf_num, projeto_hint, rt_hint = per_nf_meta.get(sel_nf, ("", sel_nf, None, None))
     default_mask = build_mask_defaults(nf_num, chave, projeto_hint, rt_hint, df_nf.loc[sel_idx])
 
@@ -563,11 +571,21 @@ if files:
     with c1:
         if st.button("📄 Gerar DOCX (este item)"):
             doc_bytes = render_mask_docx(mask_vals)
-            st.download_button("⬇️ Baixar DOCX", data=doc_bytes, file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+            st.download_button(
+                "⬇️ Baixar DOCX",
+                data=doc_bytes,
+                file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.docx",
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
     with c2:
         if st.button("📊 Gerar XLSX (este item)"):
             xls_bytes = render_mask_xlsx(mask_vals)
-            st.download_button("⬇️ Baixar XLSX", data=xls_bytes, file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.download_button(
+                "⬇️ Baixar XLSX",
+                data=xls_bytes,
+                file_name=f"mascara_{sel_nf}_{df_nf.loc[sel_idx,'COD']}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
 
     st.markdown("---")
 
@@ -575,12 +593,16 @@ if files:
     # Geração em LOTE (vários itens)
     # ===============================
     st.markdown("### Geração **em lote** (vários itens → ZIP)")
-    # Filtros de lote
-    lote_nf = st.multiselect("Filtrar por NF (opcional)", options=sorted(df_all["NF"].unique()), default=sorted(df_all["NF"].unique()))
+
+    lote_nf = st.multiselect(
+        "Filtrar por NF (opcional)",
+        options=sorted(df_all["NF"].unique()),
+        default=sorted(df_all["NF"].unique())
+    )
     df_lote = df_all[df_all["NF"].isin(lote_nf)].reset_index(drop=True)
     st.caption(f"Itens selecionáveis: {len(df_lote)}")
     sel_rows = st.multiselect(
-        "Escolha os itens para gerar em lote (por índice da tabela abaixo)",
+        "Escolha os itens (índices da tabela abaixo)",
         options=list(df_lote.index),
         format_func=lambda i: f"[{i}] NF={df_lote.loc[i,'NF']} • COD={df_lote.loc[i,'COD']} • QTD={df_lote.loc[i,'QTD']} • {df_lote.loc[i,'DESCRICAO'][:40]}..."
     )
@@ -602,7 +624,12 @@ if files:
                         fname = f"mascara_{row['NF']}_{row['COD']}.docx"
                         zf.writestr(fname, doc_bytes)
                 zip_buf.seek(0)
-                st.download_button("⬇️ Baixar ZIP (DOCX)", data=zip_buf.getvalue(), file_name="mascaras_docx.zip", mime="application/zip")
+                st.download_button(
+                    "⬇️ Baixar ZIP (DOCX)",
+                    data=zip_buf.getvalue(),
+                    file_name="mascaras_docx.zip",
+                    mime="application/zip"
+                )
     with czip2:
         if st.button("🧷 Gerar ZIP de **XLSX**"):
             if not sel_rows:
@@ -618,6 +645,11 @@ if files:
                         fname = f"mascara_{row['NF']}_{row['COD']}.xlsx"
                         zf.writestr(fname, xls_bytes)
                 zip_buf.seek(0)
-                st.download_button("⬇️ Baixar ZIP (XLSX)", data=zip_buf.getvalue(), file_name="mascaras_xlsx.zip", mime="application/zip")
+                st.download_button(
+                    "⬇️ Baixar ZIP (XLSX)",
+                    data=zip_buf.getvalue(),
+                    file_name="mascaras_xlsx.zip",
+                    mime="application/zip"
+                )
 else:
     st.info("Envie ao menos uma DANFE (PDF) para iniciar.")
