@@ -49,13 +49,12 @@ END_MARKERS = [
 
 
 # ===============================
-# Detecção do cabeçalho + colunas
+# Cabeçalho / colunas
 # ===============================
 def find_header_positions(lines: List[List[Tuple[float, float, float, float, str]]]) -> Optional[Dict[str, float]]:
     """
     Localiza o cabeçalho da tabela e retorna o x de cada coluna + y do header em "__y__".
-    Alvo primário: COD | DESCRICAO | NCM/SH | (CST?) | CFOP | UN | QTD | V_UNITARIO | V_TOTAL
-    O 'CST' pode ou não aparecer como coluna; se não vier, trataremos por sanitização.
+    Alvo: COD | DESCRICAO | NCM/SH | (CST?) | CFOP | UN | QTD | V_UNITARIO | V_TOTAL
     """
     for ln in lines:
         tokens = [no_accents_upper(w[4]) for w in ln]
@@ -68,37 +67,31 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
         for i, (x0, y0, x1, y1, text) in enumerate(ln):
             t = no_accents_upper(text)
 
-            # COD PROD: "CÓD." + "PROD."
+            # COD PROD
             if t in {"COD.", "COD", "CÓD.", "CÓD"}:
                 nxt = no_accents_upper(ln[i + 1][4]) if i + 1 < len(ln) else ""
                 if nxt.startswith("PROD"):
                     col_x["COD"] = x0
 
-            # DESCRIÇÃO
             if t.startswith("DESCRICAO") or t.startswith("DESCRIÇÃO"):
                 col_x["DESCRICAO"] = x0
 
-            # NCM/SH
             if "NCM/SH" in t:
                 col_x["NCM/SH"] = x0
 
-            # (Opcional) CST — algumas DANFEs trazem coluna "CST"
             if t == "CST":
                 col_x["CST"] = x0
 
-            # CFOP
             if t == "CFOP":
                 col_x["CFOP"] = x0
 
-            # UN
             if t == "UN":
                 col_x["UN"] = x0
 
-            # QTD
             if t == "QTD":
                 col_x["QTD"] = x0
 
-            # V. UNITÁRIO / V. TOTAL (ou "VALOR UNITÁRIO"/"VALOR TOTAL")
+            # V. UNITÁRIO / V. TOTAL (ou VALOR ...)
             if t in {"V.", "V"} and i + 1 < len(ln):
                 nxt = no_accents_upper(ln[i + 1][4])
                 if nxt.startswith("UNIT"):
@@ -113,7 +106,7 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
                     col_x["V_TOTAL"] = x0
 
         have = set(col_x.keys())
-        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}  # CST é desejável, mas não obrigatório
+        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}
         if len(have.intersection(need)) >= 6:
             col_x["__y__"] = ln[0][1]
             return col_x
@@ -205,7 +198,7 @@ def extract_table_page(page) -> List[Dict[str, str]]:
 
 
 # ===============================
-# Consolidação (linha única por item) + Sanitização NCM/CST/CFOP
+# Consolidação + sanitização NCM/CST/CFOP
 # ===============================
 def is_new_item(row: Dict[str, str]) -> bool:
     """Novo item quando a linha traz COD e NCM/SH visivelmente preenchidos."""
@@ -214,13 +207,8 @@ def is_new_item(row: Dict[str, str]) -> bool:
 
 def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[str, str, str]:
     """
-    Recebe textos crus das 3 colunas e devolve (NCM8, CST3, CFOP4) limpos.
-    Estratégia:
-     1) Tokeniza dígitos: do NCM text (e, se preciso, concatena com cst/cfop text).
-     2) Primeiro 8 dígitos -> NCM
-     3) Depois do NCM, próximo 3 dígitos -> CST
-     4) Depois, próximo 4 dígitos -> CFOP
-    Se alguma etapa não achar, usa fallback do campo correspondente (busca direta).
+    Devolve (NCM8, CST3, CFOP4) limpos a partir dos textos crus.
+    Regra: tokeniza dígitos, e pega nessa ordem: 8 -> 3 -> 4. Depois fallbacks por coluna.
     """
     def tokens_digits(s: str) -> List[str]:
         return [t for t in re.split(r"\D+", s or "") if t]
@@ -229,29 +217,19 @@ def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[st
 
     ncm = cst = cfop = ""
     i = 0
-    # NCM
     while i < len(toks):
         if len(toks[i]) == 8:
-            ncm = toks[i]
-            i += 1
-            break
+            ncm = toks[i]; i += 1; break
         i += 1
-    # CST
     while i < len(toks):
         if len(toks[i]) == 3:
-            cst = toks[i]
-            i += 1
-            break
+            cst = toks[i]; i += 1; break
         i += 1
-    # CFOP
     while i < len(toks):
         if len(toks[i]) == 4:
-            cfop = toks[i]
-            i += 1
-            break
+            cfop = toks[i]; i += 1; break
         i += 1
 
-    # Fallbacks por coluna individual (caso venham separadas)
     if not ncm:
         m = re.search(r"\b(\d{8})\b", ncm_text or "")
         if m: ncm = m.group(1)
@@ -278,7 +256,6 @@ def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str
     for r in raw_rows:
         if is_new_item(r):
             if current:
-                # Saneia tributos ao fechar item
                 ncm, cst, cfop = parse_ncm_cst_cfop(current.get("NCM/SH", ""), current.get("CST", ""), current.get("CFOP", ""))
                 current["NCM/SH"], current["CST"], current["CFOP"] = ncm, cst, cfop
                 final_rows.append(current)
@@ -324,8 +301,63 @@ def extract_table_full(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ===============================
-# Organização nas 6 colunas pedidas
-# (mantidas; CFOP/CST aparecem na tabela consolidada)
+# Extração do Nº da NF e da Chave
+# ===============================
+def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Retorna (chave_de_acesso_44, numero_nf_9_digitos) a partir do 1º cabeçalho da DANFE.
+    1) Procura "CHAVE DE ACESSO" e captura os 44 dígitos subsequentes (permitindo espaços).
+    2) A partir da chave, extrai o número da NF (nNF = 9 dígitos).
+       Composição oficial da chave (posições 1-based):
+         cUF(2) AAMM(4) CNPJ(14) mod(2) série(3) nNF(9) tpEmis(1) cNF(8) cDV(1)
+       Ou seja, nNF = dígitos 26..34 (1-based) => índice 25..34 (0-based).
+    3) Fallback: procura padrão textual "Nº 000000000" no topo.
+    """
+    try:
+        with fitz.open(stream=file_bytes, filetype="pdf") as doc:
+            if len(doc) == 0:
+                return None, None
+            txt = doc[0].get_text("text")
+            upper = txt.upper()
+
+            # --- 1) Chave de acesso ---
+            key = None
+            pos = upper.find("CHAVE DE ACESSO")
+            if pos != -1:
+                tail = upper[pos:pos + 250]  # pega um trecho após a frase
+                digits = re.findall(r"\d", tail)
+                if len(digits) >= 44:
+                    key = "".join(digits[:44])
+
+            # fallback: tentar capturar 44 dígitos próximos em todo o cabeçalho
+            if not key:
+                # procura blocos de dígitos e espaços que somem 44 dígitos
+                # estratégia simples: pega todas as sequências de dígitos; junta as maiores
+                digseq = re.findall(r"(\d[ \t]*){44,}", upper)
+                if digseq:
+                    # remover espaços e ficar com 44
+                    only_digits = re.findall(r"\d", digseq[0])
+                    if len(only_digits) >= 44:
+                        key = "".join(only_digits[:44])
+
+            nf = None
+            if key and len(key) == 44:
+                # nNF = 9 dígitos, índices 25..34 (0-based)
+                nf = key[25:34]
+
+            # --- 2) Fallback textual ---
+            if not nf:
+                m = re.search(r"\bN[º°o\.]?\s*([0-9]{1,9})\b", upper)
+                if m:
+                    nf = m.group(1).zfill(9)
+
+            return key, nf
+    except Exception:
+        return None, None
+
+
+# ===============================
+# Organização para 6 colunas
 # ===============================
 RE_IT = re.compile(r"\bIT\s*\d{2,}\b", re.IGNORECASE)
 RE_NM_NUM = re.compile(r"\bNM\.?\s*(\d{5,})\b", re.IGNORECASE)
@@ -360,9 +392,10 @@ def extrair_descricao_pos_nm(descricao: str) -> str:
 
 def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
     """
-    Desenho, Item Unifilar, NM, Descrição, QTD, Unidade.
+    NF, Desenho, Item Unifilar, NM, Descrição, QTD, Unidade.
     """
-    df = pd.DataFrame(columns=["Desenho", "Item Unifilar", "NM", "Descrição", "QTD", "Unidade"])
+    cols = ["NF", "Desenho", "Item Unifilar", "NM", "Descrição", "QTD", "Unidade"]
+    df = pd.DataFrame(columns=cols)
     if df_itens.empty:
         return df
 
@@ -370,7 +403,9 @@ def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
     desc  = df_itens["DESCRICAO"].fillna("").astype(str)
     qtd   = df_itens["QTD"].fillna("").astype(str)
     un    = df_itens["UN"].fillna("").astype(str)
+    nf    = df_itens["NF"].fillna("").astype(str)
 
+    df["NF"] = nf
     df["Desenho"] = desen
     df["Item Unifilar"] = desc.apply(extrair_item_unifilar)
     df["NM"] = desc.apply(extrair_nm)
@@ -386,71 +421,95 @@ def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
 # ===============================
 # UI Streamlit
 # ===============================
-st.set_page_config(page_title="NF-e (DANFE) — Itens consolidados + NCM/SH/CFOP/CST saneados", layout="wide")
-st.title("🧾 NF-e (DANFE) — Linha única por item + NCM/SH / CFOP / CST garantidos")
+st.set_page_config(page_title="NF-e (DANFE) — Multi-upload + coluna NF", layout="wide")
+st.title("🧾 NF-e (DANFE) — Várias notas + coluna NF por item")
 
 st.markdown(
     """
-Este app:
-- Lê a tabela pelo **cabeçalho** e consolida **várias linhas** em **UMA linha por item** (descrição não é quebrada);
-- Garante que:
-  - **NCM/SH** = primeiro código de **8 dígitos** (ex.: `73269090`);
-  - **CST** = primeiro código de **3 dígitos** após o NCM (ex.: `000`);
-  - **CFOP** = primeiro código de **4 dígitos** encontrado após CST (ex.: `5102`).
-- Mostra também a visão com as 6 colunas: **Desenho, Item Unifilar, NM, Descrição, QTD, Unidade**.
+Carregue **uma ou mais** DANFEs. O app:
+- Lê a tabela (pelo **cabeçalho**), consolidando **uma linha por item**;
+- Saneia **NCM/SH (8 dígitos)**, **CST (3 dígitos)**, **CFOP (4 dígitos)**;
+- Extrai o **nº da NF** do cabeçalho (pela **Chave de Acesso** ou fallback textual) e adiciona a coluna **NF**;
+- Mostra:
+  1) **Itens consolidados** (com NF, NCM/SH, CST, CFOP, etc.);
+  2) **Visão organizada** com **NF, Desenho, Item Unifilar, NM, Descrição, QTD, Unidade**;
+- Exporta CSV/XLSX.
 """
 )
 
-file = st.file_uploader("Selecione o PDF da DANFE", type=["pdf"])
+files = st.file_uploader("Selecione um ou mais PDFs da DANFE", type=["pdf"], accept_multiple_files=True)
 btn = st.button("📤 Extrair")
 
-if btn and file is not None:
-    raw = file.read()
-    with st.spinner("Lendo a tabela e consolidando itens..."):
-        df_items = extract_table_full(raw)
+if btn and files:
+    all_items = []
+    for f in files:
+        file_bytes = f.read()
 
-    if df_items.empty:
-        st.error("Não consegui localizar/consolidar a tabela de itens. Se puder, me envie o PDF para calibrarmos.")
+        # Extrai Chave de Acesso e Nº da NF
+        chave, nf = extract_access_key_and_nf_number(file_bytes)
+        nf_label = nf if nf else "NF_DESCONHECIDA"
+
+        # Extrai itens (consolidados) desta NF
+        with st.spinner(f"Lendo itens da NF {nf_label} ({f.name})..."):
+            df_items = extract_table_full(file_bytes)
+
+        if df_items.empty:
+            st.warning(f"⚠️ Não encontrei itens na NF {nf_label} ({f.name}).")
+            continue
+
+        # Anexa colunas de identificação da NF
+        df_items.insert(0, "NF", nf_label)
+        df_items.insert(1, "Arquivo", f.name)
+        df_items.insert(2, "Chave_Acesso", chave or "")
+
+        all_items.append(df_items)
+
+    if not all_items:
+        st.error("Nenhuma NF válida encontrada.")
     else:
-        st.success(f"Itens consolidados (uma linha por item): {len(df_items)}")
+        df_all = pd.concat(all_items, ignore_index=True)
 
-        st.subheader("1) Itens consolidados (NCM/SH, CST, CFOP saneados)")
-        st.dataframe(df_items, use_container_width=True, height=420)
+        st.success(f"Notas processadas: {len(all_items)} — Itens totais: {len(df_all)}")
 
-        # export consolidados
+        st.subheader("1) Itens consolidados (com NF / NCM/SH / CST / CFOP)")
+        st.dataframe(df_all, use_container_width=True, height=420)
+
+        # Exports consolidados
         c1, c2 = st.columns(2)
         with c1:
-            csv_bytes = df_items.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 Baixar CSV (consolidados)", data=csv_bytes, file_name="itens_consolidados.csv", mime="text/csv")
+            csv_bytes = df_all.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 CSV (consolidados + NF)", data=csv_bytes, file_name="itens_consolidados_multi_nf.csv", mime="text/csv")
         with c2:
             xls = io.BytesIO()
             with pd.ExcelWriter(xls, engine="openpyxl") as w:
-                df_items.to_excel(w, index=False, sheet_name="Consolidados")
+                df_all.to_excel(w, index=False, sheet_name="Consolidados")
             xls.seek(0)
             st.download_button(
-                "📥 Baixar Excel (consolidados)",
+                "📥 Excel (consolidados + NF)",
                 data=xls,
-                file_name="itens_consolidados.xlsx",
+                file_name="itens_consolidados_multi_nf.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        st.subheader("2) Visão organizada (6 colunas)")
-        df6 = organizar_para_seis_colunas(df_items)
-        st.dataframe(df6, use_container_width=True, height=420)
+        st.subheader("2) Visão organizada (NF + 6 colunas solicitadas)")
+        df6_parts = []
+        for nf_key, df_nf in df_all.groupby("NF", sort=False):
+            df6_parts.append(organizar_para_seis_colunas(df_nf))
+        df6_all = pd.concat(df6_parts, ignore_index=True)
+        st.dataframe(df6_all, use_container_width=True, height=420)
 
-        # export 6 colunas
         c3, c4 = st.columns(2)
         with c3:
-            csv6 = df6.to_csv(index=False).encode("utf-8-sig")
-            st.download_button("📥 Baixar CSV (6 colunas)", data=csv6, file_name="itens_6_colunas.csv", mime="text/csv")
+            csv6 = df6_all.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 CSV (NF + 6 colunas)", data=csv6, file_name="itens_nf_6colunas_multi.csv", mime="text/csv")
         with c4:
             xls6 = io.BytesIO()
             with pd.ExcelWriter(xls6, engine="openpyxl") as w:
-                df6.to_excel(w, index=False, sheet_name="6 colunas")
+                df6_all.to_excel(w, index=False, sheet_name="NF + 6 colunas")
             xls6.seek(0)
             st.download_button(
-                "📥 Baixar Excel (6 colunas)",
+                "📥 Excel (NF + 6 colunas)",
                 data=xls6,
-                file_name="itens_6_colunas.xlsx",
+                file_name="itens_nf_6colunas_multi.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
