@@ -195,7 +195,7 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
 
             nf = None
             if key and len(key) == 44:
-                nf = key25:34[1]()  # nNF (9 dígitos)
+                nf = key25:341  # nNF (9 dígitos)
 
             if not nf:
                 m = re.search(r"\bN[º°O\.]?\s*([0-9]{1,9})\b", upper)
