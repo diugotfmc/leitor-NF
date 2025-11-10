@@ -10,7 +10,7 @@ import fitz  # PyMuPDF
 
 
 # ===============================
-# Utilitários básicos
+# Utilitários
 # ===============================
 def no_accents_upper(s: str) -> str:
     s = unicodedata.normalize("NFKD", s).encode("ASCII", "ignore").decode("ASCII")
@@ -91,7 +91,7 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
             if t == "QTD":
                 col_x["QTD"] = x0
 
-            # V. UNITÁRIO / V. TOTAL (ou VALOR ...)
+            # V. UNITÁRIO / V. TOTAL (ou VALOR UNITÁRIO / VALOR TOTAL)
             if t in {"V.", "V"} and i + 1 < len(ln):
                 nxt = no_accents_upper(ln[i + 1][4])
                 if nxt.startswith("UNIT"):
@@ -106,7 +106,7 @@ def find_header_positions(lines: List[List[Tuple[float, float, float, float, str
                     col_x["V_TOTAL"] = x0
 
         have = set(col_x.keys())
-        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}
+        need = {"COD", "DESCRICAO", "NCM/SH", "CFOP", "UN", "QTD"}  # CST é opcional
         if len(have.intersection(need)) >= 6:
             col_x["__y__"] = ln[0][1]
             return col_x
@@ -208,7 +208,7 @@ def is_new_item(row: Dict[str, str]) -> bool:
 def parse_ncm_cst_cfop(ncm_text: str, cst_text: str, cfop_text: str) -> Tuple[str, str, str]:
     """
     Devolve (NCM8, CST3, CFOP4) limpos a partir dos textos crus.
-    Regra: tokeniza dígitos, e pega nessa ordem: 8 -> 3 -> 4. Depois fallbacks por coluna.
+    Regra: tokeniza dígitos e pega nessa ordem: 8 -> 3 -> 4. Depois fallbacks por coluna.
     """
     def tokens_digits(s: str) -> List[str]:
         return [t for t in re.split(r"\D+", s or "") if t]
@@ -287,7 +287,7 @@ def consolidate_rows_into_items(raw_rows: List[Dict[str, str]]) -> List[Dict[str
     return final_rows
 
 
-def extract_table_full(file_bytes: bytes) -> pd.DataFrame:
+def extract_items_dataframe(file_bytes: bytes) -> pd.DataFrame:
     """Extrai de todas as páginas e devolve uma linha por item (NCM/SH, CST, CFOP saneados)."""
     out_rows = []
     with fitz.open(stream=file_bytes, filetype="pdf") as doc:
@@ -301,17 +301,13 @@ def extract_table_full(file_bytes: bytes) -> pd.DataFrame:
 
 
 # ===============================
-# Extração do Nº da NF e da Chave
+# Nº da NF e Chave de Acesso
 # ===============================
 def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], Optional[str]]:
     """
-    Retorna (chave_de_acesso_44, numero_nf_9_digitos) a partir do 1º cabeçalho da DANFE.
-    1) Procura "CHAVE DE ACESSO" e captura os 44 dígitos subsequentes (permitindo espaços).
-    2) A partir da chave, extrai o número da NF (nNF = 9 dígitos).
-       Composição oficial da chave (posições 1-based):
-         cUF(2) AAMM(4) CNPJ(14) mod(2) série(3) nNF(9) tpEmis(1) cNF(8) cDV(1)
-       Ou seja, nNF = dígitos 26..34 (1-based) => índice 25..34 (0-based).
-    3) Fallback: procura padrão textual "Nº 000000000" no topo.
+    Retorna (chave_44, numero_nf_9) a partir da 1ª página.
+    Preferência: "CHAVE DE ACESSO" -> 44 dígitos; nNF = pos. 26..34 (1-based) => [25:34] (0-based).
+    Fallback: regex "Nº 000000000".
     """
     try:
         with fitz.open(stream=file_bytes, filetype="pdf") as doc:
@@ -320,32 +316,26 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
             txt = doc[0].get_text("text")
             upper = txt.upper()
 
-            # --- 1) Chave de acesso ---
             key = None
             pos = upper.find("CHAVE DE ACESSO")
             if pos != -1:
-                tail = upper[pos:pos + 250]  # pega um trecho após a frase
+                tail = upper[pos:pos + 300]
                 digits = re.findall(r"\d", tail)
                 if len(digits) >= 44:
                     key = "".join(digits[:44])
 
-            # fallback: tentar capturar 44 dígitos próximos em todo o cabeçalho
             if not key:
-                # procura blocos de dígitos e espaços que somem 44 dígitos
-                # estratégia simples: pega todas as sequências de dígitos; junta as maiores
-                digseq = re.findall(r"(\d[ \t]*){44,}", upper)
-                if digseq:
-                    # remover espaços e ficar com 44
-                    only_digits = re.findall(r"\d", digseq[0])
+                # fallback tentando achar 44 dígitos próximos em todo o cabeçalho
+                m = re.search(r"(?:\D*\d){44}", upper)  # padrão permissivo
+                if m:
+                    only_digits = re.findall(r"\d", m.group(0))
                     if len(only_digits) >= 44:
                         key = "".join(only_digits[:44])
 
             nf = None
             if key and len(key) == 44:
-                # nNF = 9 dígitos, índices 25..34 (0-based)
-                nf = key[25:34]
+                nf = key[25:34]  # 9 dígitos
 
-            # --- 2) Fallback textual ---
             if not nf:
                 m = re.search(r"\bN[º°o\.]?\s*([0-9]{1,9})\b", upper)
                 if m:
@@ -357,7 +347,7 @@ def extract_access_key_and_nf_number(file_bytes: bytes) -> Tuple[Optional[str], 
 
 
 # ===============================
-# Organização para 6 colunas
+# Organização nas 6 colunas pedidas
 # ===============================
 RE_IT = re.compile(r"\bIT\s*\d{2,}\b", re.IGNORECASE)
 RE_NM_NUM = re.compile(r"\bNM\.?\s*(\d{5,})\b", re.IGNORECASE)
@@ -421,17 +411,17 @@ def organizar_para_seis_colunas(df_itens: pd.DataFrame) -> pd.DataFrame:
 # ===============================
 # UI Streamlit
 # ===============================
-st.set_page_config(page_title="NF-e (DANFE) — Multi-upload + coluna NF", layout="wide")
-st.title("🧾 NF-e (DANFE) — Várias notas + coluna NF por item")
+st.set_page_config(page_title="NF-e (DANFE) — Multi-upload com NF + NCM/SH/CST/CFOP saneados", layout="wide")
+st.title("🧾 NF-e (DANFE) — Várias notas + NF por item + NCM/SH/CST/CFOP saneados")
 
 st.markdown(
     """
 Carregue **uma ou mais** DANFEs. O app:
 - Lê a tabela (pelo **cabeçalho**), consolidando **uma linha por item**;
 - Saneia **NCM/SH (8 dígitos)**, **CST (3 dígitos)**, **CFOP (4 dígitos)**;
-- Extrai o **nº da NF** do cabeçalho (pela **Chave de Acesso** ou fallback textual) e adiciona a coluna **NF**;
+- Extrai **Chave de Acesso** e o **nº da NF** (coluna **NF**) do cabeçalho;
 - Mostra:
-  1) **Itens consolidados** (com NF, NCM/SH, CST, CFOP, etc.);
+  1) **Itens consolidados** (com NF, Arquivo, Chave, NCM/SH, CST, CFOP, etc.);
   2) **Visão organizada** com **NF, Desenho, Item Unifilar, NM, Descrição, QTD, Unidade**;
 - Exporta CSV/XLSX.
 """
@@ -451,7 +441,7 @@ if btn and files:
 
         # Extrai itens (consolidados) desta NF
         with st.spinner(f"Lendo itens da NF {nf_label} ({f.name})..."):
-            df_items = extract_table_full(file_bytes)
+            df_items = extract_items_dataframe(file_bytes)
 
         if df_items.empty:
             st.warning(f"⚠️ Não encontrei itens na NF {nf_label} ({f.name}).")
@@ -471,7 +461,7 @@ if btn and files:
 
         st.success(f"Notas processadas: {len(all_items)} — Itens totais: {len(df_all)}")
 
-        st.subheader("1) Itens consolidados (com NF / NCM/SH / CST / CFOP)")
+        st.subheader("1) Itens consolidados (com NF / Chave / NCM/SH / CST / CFOP)")
         st.dataframe(df_all, use_container_width=True, height=420)
 
         # Exports consolidados
@@ -491,9 +481,9 @@ if btn and files:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
-        st.subheader("2) Visão organizada (NF + 6 colunas solicitadas)")
+        st.subheader("2) Visão organizada (NF + 6 colunas pedidas)")
         df6_parts = []
-        for nf_key, df_nf in df_all.groupby("NF", sort=False):
+        for _, df_nf in df_all.groupby("NF", sort=False):
             df6_parts.append(organizar_para_seis_colunas(df_nf))
         df6_all = pd.concat(df6_parts, ignore_index=True)
         st.dataframe(df6_all, use_container_width=True, height=420)
